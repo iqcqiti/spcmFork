@@ -1,4 +1,4 @@
-"""  
+""" 
 Spectrum Instrumentation GmbH (c) 2024
 
 16_dds_test_trigger_envlope.py
@@ -100,103 +100,194 @@ def plot_gaussian_pulse(time_points, slopes, total_duration, num_segments, ampli
     plt.show(block=False)
 
 # Set the highest process priority to the Python process, to enable highest possible command streaming
-card : spcm.Card
-# with spcm.Card('/dev/spcm0') as card:                         # if you want to open a specific card
-# with spcm.Card('TCPIP::192.168.1.10::inst0::INSTR') as card:  # if you want to open a remote card
-with spcm.Card(serial_number=22189) as card:# if you want to open a card by its serial number
-# with spcm.Card(card_type=spcm.SPCM_TYPE_AO) as card:            # if you want to open the first card of a specific type
-    print("Using card:", card)
+class Card_Controller:
+    def __init__(self, Card: spcm.Card):
+        self.card = Card
+        self.init_card()
+    def stop_card(self):
+        self.card.stop() # have to reset the dds for reprogramming
+    def start_card(self):
+        self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
+    def reset_dds(self,DMA=True):
+        self.dds.reset()
+        if DMA:
+            self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
+        else:   
+            self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_SINGLE)
 
-    # setup card for DDS
-    card.card_mode(spcm.SPC_REP_STD_DDS)
+    def program_card(self, pulse_slopes, time_step, fixed_freq_Hz, loop_count):
 
-    # Setup the channels
-    channels = spcm.Channels(card)
-    channels.enable(True)
-    channels.output_load(50 * units.ohm)
-    channels.amp(2 * units.V)
-    
-    trigger = spcm.Trigger(card)
-    trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
-    trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
-    trigger.ext0_level0(0.5 * units.V) # Trigger level is 1.5 V (1500 mV)
-    trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
-    trigger.delay(0) # no trigger delay
-    
-    card.write_setup() # IMPORTANT! this turns on the card's system clock signals, that are required for DDS to work
-    
-    # Setup DDS
-    dds = spcm.DDS(card)
-    dds.reset()
+        for i in range(loop_count): # loop to allow multiple triggers
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+            self.dds[0].amplitude_slope(0)
+            self.dds[0].freq(fixed_freq_Hz)
+            self.dds[0].amp(0)
+            self.dds.exec_at_trg()
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_TIMER) 	
+            ##################################################################################
+            # Slopes
+            self.dds.trg_timer(time_step * units.s)
 
-    dds.data_transfer_mode(spcm.SPCM_DDS_DTM_DMA)
-    # dds.data_transfer_mode(spcm.SPCM_DDS_DTM_SINGLE)
-    fixed_freq_Hz = 200 * units.MHz
+            # Loop through the slopes and send them to the AWG
+            for i in range(len(pulse_slopes)):
+                self.dds[0].amplitude_slope(pulse_slopes[i] * 1e6) # The slope is multiplied by 1e6 for dac units
+                self.dds.exec_at_trg()
+
+            ######## Gaussian envelope end ########
+            
+            # self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_NONE)
+            self.dds[0].amplitude_slope(0)
+            self.dds[0].amp(0)
+            self.dds.exec_at_trg()
+        self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+        self.dds.exec_now()
+
+    def program_sine_wave(self, freq, amplitude, duration, loop_count,start_seq=False):
+        if not isinstance(freq, list):
+            freq = [freq]
+        if not isinstance(amplitude, list):
+            amplitude = [amplitude]
+
+
+        for _ in range(loop_count):
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+            if not start_seq:
+                self.dds.exec_now()
+            else:
+                if _ > 0 :
+                    self.dds.exec_now()
+            self.dds[0].freq(0)
+            self.dds[0].amp(0)
+            self.dds.exec_at_trg()
+            self.dds[0].freq(freq[0])
+            self.dds[0].amp(amplitude[0])
+
+
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_TIMER)
+            self.dds.trg_timer(duration * units.s)
+            self.dds.exec_now()
+
+            self.dds[0].freq(0)
+            self.dds[0].amp(0)
+            self.dds.exec_at_trg()
+
+    def write_to_card(self):            
+        self.dds.write_to_card()
+
+            
+
+    def program_gaussian_envelope(self,total_duration,freq, num_segments, amplitude=1.0, mean=0.0, std_dev=1.0,loop_count=100):
+
+        # Pulse and AWG parameters
+        # The duration was increased to ensure the time_step is a valid, non-zero value for the AWG.
+        time_step = total_duration / num_segments
+        print("Time step:", time_step)
+        # Get hardware-defined min/max slope values
+        min_slope = self.card.get_d(spcm.SPC_DDS_AVAIL_AMP_SLOPE_MIN)
+        max_slope = self.card.get_d(spcm.SPC_DDS_AVAIL_AMP_SLOPE_MAX)
+        amp_step_size = self.card.get_d(spcm.SPC_DDS_AMP_RAMP_STEPSIZE)
+        print(f"Hardware-defined amplitude ramp step size: {amp_step_size}")
+
+        print(f"Hardware-defined amplitude slope range: Min={min_slope*1e-6:.2f} V/us, Max={max_slope*1e-6:.2f}V/us")
+        # Generate the slopes and time points
+        pulse_slopes, time_points = generate_gaussian_slopes(
+            total_duration=total_duration,
+            num_segments=num_segments,
+            amplitude=amplitude,
+            mean=mean,
+            std_dev=std_dev
+        )
+        print("Slopes:", pulse_slopes)
+
+        # Plot the pulse for visualization
+        #plot_gaussian_pulse(time_points, pulse_slopes, total_duration, num_segments, amplitude, mean, std_dev)
+
+        self.program_card(pulse_slopes, time_step, freq, loop_count)
+    
+    def init_card(self):
+        
+        self.card.card_mode(spcm.SPC_REP_STD_DDS)
+        # Setup the channels
+        self.channels = spcm.Channels(self.card)
+        self.channels.enable(True)
+        self.channels.output_load(50 * units.ohm)
+        self.channels.amp(2 * units.V)
+
+        self.trigger = spcm.Trigger(self.card)
+        self.trigger.or_mask(spcm.SPC_TMASK_EXT0) # disable default software trigger
+        self.trigger.ext0_mode(spcm.SPC_TM_POS) # positive edge
+        self.trigger.ext0_level0(1 * units.V) # Trigger level is 1.5 V (1500 mV)
+        self.trigger.ext0_coupling(spcm.COUPLING_DC) # set DC coupling
+        self.trigger.delay(0) # no trigger delay
+
+        self.card.write_setup() # IMPORTANT! this turns on the card's system clock signals, that are required for DDS to work
+
+        # Setup DDS
+        self.dds = spcm.DDS(self.card)
+        self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_SINGLE)
+
+
+    def reset_card(self):
+        self.card.reset()
+        self.init_card()
+
+awg_card : spcm.Card
+with spcm.Card(serial_number=22189) as awg_card:# if you want to open a card by its serial number
+
+    cc= Card_Controller(awg_card)
+    cc.reset_card()
+
+    fixed_freq_Hz = 1 * units.MHz
     ######## Guassian envelope ########
     # Parameters for the Gaussian pulse
-    amplitude = 20000       # Amplitude ($A$)
+    amplitude = 1       # Amplitude ($A$)
     mean = 0.0      # Mean ($\mu$)
-    std_dev = 0.5   # Standard deviation ($\sigma$)
-    amp_start = 0 * units.percent
+    std_dev = 0.005   # Standard deviation ($\sigma$)
 
     # Pulse and AWG parameters
     # The duration was increased to ensure the time_step is a valid, non-zero value for the AWG.
-    duration = 10.0e-6    # Total time duration of the pulse (e.g., 10 microseconds)
+    duration = 10*1e-6    # Total time duration of the pulse (e.g., 10 microseconds)
     segments = 20         # Number of segments for the AWG
-    time_step = duration / segments
-    print("Time step:", time_step)
-    # Get hardware-defined min/max slope values
-    min_slope = card.get_d(spcm.SPC_DDS_AVAIL_AMP_SLOPE_MIN)
-    max_slope = card.get_d(spcm.SPC_DDS_AVAIL_AMP_SLOPE_MAX)
-    amp_step_size = card.get_d(spcm.SPC_DDS_AMP_RAMP_STEPSIZE)
-    print(f"Hardware-defined amplitude ramp step size: {amp_step_size}")
 
-    print(f"Hardware-defined amplitude slope range: Min={min_slope*1e-6:.2f} V/us, Max={max_slope*1e-6:.2f}V/us")
-    # Generate the slopes and time points
-    pulse_slopes, time_points = generate_gaussian_slopes(
+
+    cc.program_sine_wave(fixed_freq_Hz, 1, 5e-6
+                           , loop_count=2, start_seq=True)
+    cc.program_sine_wave(fixed_freq_Hz, 1, 5e-6
+                           , loop_count=2)
+    cc.program_gaussian_envelope(
         total_duration=duration,
+        freq=fixed_freq_Hz,
         num_segments=segments,
         amplitude=amplitude,
         mean=mean,
-        std_dev=std_dev
-    )
-    print("Slopes:", pulse_slopes)
+        std_dev=std_dev,
+        loop_count=2
+    )   
+    cc.program_sine_wave(fixed_freq_Hz, 1, 5e-6
+                           , loop_count=2)
+    cc.program_gaussian_envelope(
+        total_duration=duration,
+        freq=fixed_freq_Hz,
+        num_segments=segments,
+        amplitude=amplitude,
+        mean=mean,
+        std_dev=std_dev,
+        loop_count=2
+    )   
+    cc.program_sine_wave(fixed_freq_Hz, 1, 5e-6
+                           , loop_count=2)
 
-    # Plot the pulse for visualization
-    plot_gaussian_pulse(time_points, pulse_slopes, duration, segments, amplitude, mean, std_dev)
+    cc.write_to_card()
+    cc.start_card()
+    
+    print("Waiting for trigger... (Signal should run for 1ms and stop)")
+    # monitor the triggers sent from external generator
+    tc_old = -1
+    while True:
+        time.sleep(0.01)
+        tc = cc.trigger.trigger_counter()
 
-    # Amplitude ramp settings
-
-
-    ##################################################################################
-    # Start of DDS configuration and sending commands to the card 
-    initail_time = time.time()
-    for i in range(74890): # loop to allow multiple triggers
-        dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
-        dds[0].amplitude_slope(0)
-        dds[0].freq(fixed_freq_Hz)
-        dds[0].amp(amp_start)
-        dds.exec_at_trg()
-        dds.trg_src(spcm.SPCM_DDS_TRG_SRC_TIMER) 	
-        ##################################################################################
-        # Slopes
-        dds.trg_timer(time_step * units.s)
-
-        # Loop through the slopes and send them to the AWG
-        for i in range(len(pulse_slopes)):
-            dds[0].amplitude_slope(pulse_slopes[i] * 1e6) # The slope is multiplied by 1e6 for dac units
-            dds.exec_at_trg()
-
-        ######## Guassian envelope end ########
-        
-        # dds.trg_src(spcm.SPCM_DDS_TRG_SRC_NONE)
-        dds[0].amplitude_slope(0)
-        dds[0].amp(0)
-        dds.exec_at_trg()
-        
-    dds.write_to_card()
-    print(f"DDS configuration time: {time.time() - initail_time:.2f} seconds")
-        # Start command including enable of trigger engine
-    card.start(spcm.M2CMD_CARD_ENABLETRIGGER, spcm.M2CMD_CARD_FORCETRIGGER)    
-    ## make a loop to show the trigger counter only when a trigger is detected
-    input("Press Enter to Exit")
+        if tc != tc_old:
+            tc_old = tc
+            print(f"Trigger count: {tc}", flush=True)
+    input("DDS Gaussian envelope programmed. Press Enter to stop and exit...")    
