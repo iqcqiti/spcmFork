@@ -1,0 +1,268 @@
+""" 
+Spectrum Instrumentation GmbH (c) 2024
+Refactored DDS Pulse Generator
+"""
+
+import spcm
+from spcm import units
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# ==========================================
+# Mathematical Helper Functions
+# ==========================================
+
+def generate_gaussian_slopes(total_duration, num_segments, amplitude=1.0, mean=0.0, std_dev=1.0):
+    """
+    Generates the slopes for a truncated Gaussian pulse profile.
+    """
+    # Define the time step
+    time_step = total_duration / num_segments
+    
+    # Generate the time points for the pulse
+    time_points = np.linspace(-total_duration / 2, total_duration / 2, num_segments + 1)
+    
+    # Calculate Gaussian values: y = A * exp(-(t-mu)^2 / (2*sigma^2))
+    gaussian_values = amplitude * np.exp(-((time_points - mean)**2) / (2 * std_dev**2))
+    
+    # Calculate slopes: slope = dy / dx
+    slopes = np.diff(gaussian_values) / time_step
+    
+    return slopes, time_points
+
+# ==========================================
+# DDS Controller Class
+# ==========================================
+
+class DDSSequenceBuilder:
+    """
+    Manages the Spectrum DDS Card to create sequences of externally triggered pulses.
+    
+    Logic:
+    1. The card waits in 'External Trigger' mode.
+    2. Upon trigger, it switches to 'Timer Trigger' mode to execute the pulse shape (slopes or duration).
+    3. Upon completion, it switches back to 'External Trigger' mode.
+    """
+    def __init__(self, card: spcm.Card):
+        self.card = card
+        self.dds = spcm.DDS(self.card)
+        self.channels = spcm.Channels(self.card)
+        self.trigger = spcm.Trigger(self.card)
+        
+        # Setup defaults
+        self._init_hardware()
+
+    def _init_hardware(self):
+        """Initializes card channels, trigger settings, and DDS mode."""
+        self.card.card_mode(spcm.SPC_REP_STD_DDS)
+        
+        # Channel Setup
+        self.channels.enable(True)
+        self.channels.output_load(50 * units.ohm)
+        self.channels.amp(2 * units.V) # Max output amplitude
+
+        # Trigger Setup (External Only)
+        self.trigger.or_mask(spcm.SPC_TMASK_EXT0)
+        self.trigger.ext0_mode(spcm.SPC_TM_POS)
+        self.trigger.ext0_level0(1 * units.V)
+        self.trigger.ext0_coupling(spcm.COUPLING_DC)
+        self.trigger.delay(0)
+
+        # Write setup to activate clock
+        self.card.write_setup()
+
+        # DDS Setup
+        self.dds.reset()
+        self.dds.data_transfer_mode(spcm.SPCM_DDS_DTM_SINGLE)
+
+    def _transition_trigger_source(self, target_source, timer_val=None):
+        """
+        Handles the complex logic of switching trigger sources in the DDS command stream.
+        
+        Protocol based on user finding:
+        1. exec_at_trg() : Queue the change for the NEXT trigger event.
+        2. Change Source : Set the new source (and timer if applicable).
+        3. exec_now()    : Force the source change logic into the buffer.
+        """
+        # 1. Wait for the current trigger phase to complete/start
+
+        # 2. Configure the new source
+        if timer_val is not None:
+            self.dds.trg_timer(timer_val)
+        
+        self.dds.trg_src(target_source)
+
+        # 3. Force update (Swallows the first-time error if the buffer is empty)
+        try:
+            self.dds.exec_now()
+        except Exception:
+            # This is expected on the very first command if the card isn't running yet
+            pass
+
+    def add_gaussian_pulse(self, freq, duration, amplitude, num_segments, mean=0.0, std_dev=1.0, loop_count=1):
+        """
+        Adds a Gaussian pulse sequence.
+        
+        Sequence: Wait for Ext -> Play Slopes (Timer) -> Stop -> Wait for Ext
+        """
+        if not isinstance(freq, list):
+            freq = [freq]
+        if not isinstance(amplitude, list):
+            amplitude = [amplitude]
+        
+        time_step = duration / num_segments
+        slopes, _ = generate_gaussian_slopes(duration, num_segments, amplitude, mean, std_dev)
+
+        for _ in range(loop_count):
+            # --- PHASE 1: PREPARE (Wait for External Trigger) ---
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+            for i in range(len(freq)):
+                self.dds[i].amplitude_slope(0)
+                self.dds[i].freq(freq[i])
+                self.dds[i].amp(0) # Start at 0 amplitude
+            self.dds.exec_at_trg()
+
+            
+            # --- PHASE 2: EXECUTE (Switch to Internal Timer on Trigger) ---
+            # When Ext Trigger hits, switch immediately to Timer to play the slopes
+            self._transition_trigger_source(spcm.SPCM_DDS_TRG_SRC_TIMER, timer_val=time_step * units.s)
+
+            # --- PHASE 3: PLAY SLOPES ---
+            for slope in slopes:
+                for i in range(len(freq)):
+                    self.dds[i].amplitude_slope(slope * 1e6) # Convert to DAC units
+                self.dds.exec_at_trg() # Wait for timer step
+
+            # --- PHASE 4: RESET (Switch back to External) ---
+            # Stop the slope and reset amplitude
+            for i in range(len(freq)):
+                self.dds[i].amplitude_slope(0)
+                self.dds[i].amp(0) 
+            self.dds.exec_at_trg()
+
+            
+            # Switch back to waiting for External Trigger
+            self._transition_trigger_source(spcm.SPCM_DDS_TRG_SRC_CARD)
+
+    def add_sine_pulse(self, freq, amplitude, duration, loop_count):
+        if not isinstance(freq, list):
+            freq = [freq]
+        if not isinstance(amplitude, list):
+            amplitude = [amplitude]
+
+
+        for _ in range(loop_count):
+            self.dds.trg_src(spcm.SPCM_DDS_TRG_SRC_CARD)
+            for i in range(len(freq)):
+                self.dds[i].freq(0)
+                self.dds[i].amp(0)
+            self.dds.exec_at_trg()
+            for i in range(len(freq)):
+                self.dds[i].freq(freq[i])
+                self.dds[i].amp(amplitude[i])
+            self.dds.exec_now()
+            
+            self._transition_trigger_source( spcm.SPCM_DDS_TRG_SRC_TIMER, timer_val=duration * units.s)
+            for i in range(len(freq)):
+                self.dds[i].freq(0)
+                self.dds[i].amp(0)
+            self.dds.exec_at_trg()
+            self._transition_trigger_source( spcm.SPCM_DDS_TRG_SRC_CARD)
+
+
+
+    def write_and_start(self):
+        """Transfers the sequence to the card and starts execution."""
+        self.dds.write_to_card()
+        self.card.start(spcm.M2CMD_CARD_ENABLETRIGGER)
+
+    def reset(self):
+        self.card.stop()
+        self.card.reset()
+        self._init_hardware()
+
+
+# ==========================================
+# Main Execution
+# ==========================================
+
+if __name__ == "__main__":
+    # Open the card
+    with spcm.Card(serial_number=22189) as card:
+        
+        # 1. Initialize Controller
+        seq = DDSSequenceBuilder(card)
+        
+        # 2. Define Parameters
+        fixed_freq_1 = 1 * units.MHz
+        fixed_freq_2 = .5 * units.MHz
+        
+        gaussian_dur = 10e-6
+        gaussian_segs = 20
+        
+        # 3. Build Sequence
+        print("Building sequence...")
+        
+        # Example: 4 Gaussian Pulses (Freq 1)
+        seq.add_gaussian_pulse(
+            freq=fixed_freq_1,
+            duration=gaussian_dur,
+            amplitude=1.0,
+            num_segments=gaussian_segs,
+            std_dev=0.005,
+            loop_count=4
+        )
+        
+        # Example: 2 Sine Pulses (Freq 1)
+        seq.add_sine_pulse(
+            freq=[  fixed_freq_1,fixed_freq_2],
+            amplitude=[.4,.4],
+            duration=5e-6,
+            loop_count=2
+        )
+
+        # Example: 2 Gaussian Pulses (Freq 2 - Different Freq test)
+        seq.add_gaussian_pulse(
+            freq=fixed_freq_2,
+            duration=gaussian_dur,
+            amplitude=0.8,
+            num_segments=gaussian_segs,
+            std_dev=0.005,
+            loop_count=2
+        )
+        seq.add_sine_pulse(
+            freq=[  fixed_freq_1],
+            amplitude=[.4],
+            duration=5e-6,
+            loop_count=2
+        )
+        seq.add_gaussian_pulse(
+            freq=[  fixed_freq_1,fixed_freq_2],
+            duration=gaussian_dur,
+            amplitude=0.8,
+            num_segments=gaussian_segs,
+            std_dev=0.005,
+            loop_count=2
+        )
+
+        # 4. Upload and Start
+        print("Writing to card...")
+        seq.write_and_start()
+        
+        print("Card running. Waiting for External Triggers...")
+        print("(Press Ctrl+C to stop)")
+
+        # 5. Monitoring Loop
+        try:
+            tc_old = -1
+            while True:
+                time.sleep(0.01)
+                tc = seq.trigger.trigger_counter()
+                if tc != tc_old:
+                    print(f"Trigger count: {tc}")
+                    tc_old = tc
+        except KeyboardInterrupt:
+            print("\nStopping...")
+            card.stop()
